@@ -70,7 +70,11 @@ public class MainActivity extends AppCompatActivity {
 
         // 升级/首次启动自愈：自动备份旧环境；全新环境且 Download/DSHA 有旧备份时提示恢复
         if (HarnessController.get(this).upgradeGuard()) {
-            HarnessController.get(this).maybePromptRestore(this);
+            // 仅解压完成进入主界面（skip_extract=true）才检测"全新环境可恢复"，
+            // 避免首启解压前 rootfs 未就绪误弹恢复框（恢复内容会被解压流程覆盖）
+            if (getIntent().getBooleanExtra("skip_extract", false)) {
+                HarnessController.get(this).maybePromptRestore(this);
+            }
         }
 
         requestPermissions();
