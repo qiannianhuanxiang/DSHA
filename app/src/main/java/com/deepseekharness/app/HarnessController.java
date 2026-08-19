@@ -1821,7 +1821,8 @@ public class HarnessController {
         if (last > 0) { // 真升级（非全新安装）：后台自动备份旧环境
             IO.execute(() -> {
                 try {
-                    if (rootfsFile("root/.dsh").isDirectory()) {
+                    // rootfs 已就绪（有 bash）才备份；未解压/未安装时跳过
+                    if (proot.isInstalled() && rootfsFile("root/.dsh").isDirectory()) {
                         String p = BackupManager.backupToExternal(appContext, HarnessController.this);
                         if (p != null) android.util.Log.i("DSHA", "升级自动备份完成: " + p);
                     }
@@ -1852,6 +1853,7 @@ public class HarnessController {
     /** 从外部备份 tar.gz 恢复 .dsh + .env 到 rootfs；返回结果文案 */
     public String restoreFromBackup(File backup) {
         try {
+            if (!proot.isInstalled()) return "环境未就绪，请先完成环境解压/安装后再恢复";
             File tmp = rootfsFile("root/.dsha-restore.tar.gz");
             copyFile(backup, tmp);
             TarGzipExtractor.extract(tmp, new File(proot.getRootfsDir(), "root"));
@@ -1870,6 +1872,7 @@ public class HarnessController {
     public void maybePromptRestore(final android.app.Activity act) {
         IO.execute(() -> {
             try {
+                if (!proot.isInstalled()) return; // rootfs 未就绪（未解压/未安装）不弹
                 if (rootfsFile("root/.dsh").isDirectory()) return; // 已有数据，不打扰
                 final File b = findLatestExternalBackup();
                 if (b == null) return;
