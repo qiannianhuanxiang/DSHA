@@ -3492,6 +3492,45 @@ public class HarnessController {
 
     /** 外部下载目录 Download/DSHA 里最新的 DSHA 备份；没有返回 null */
     public File findLatestExternalBackup() {
+        // Android 10+：优先 MediaStore 查询（无需「所有文件访问」权限）。分区存储下直接
+        // File.listFiles() 枚举不到 Download/DSHA —— 而 DSHA 从不请求 MANAGE_EXTERNAL_STORAGE
+        // （只在 manifest 声明 + isExternalStorageManager 检测），于是 maybePromptRestore 的
+        // 自动恢复在大多数设备上永远发现不了备份（issue #22）。
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            try {
+                File dirBase = android.os.Environment.getExternalStoragePublicDirectory(
+                        android.os.Environment.DIRECTORY_DOWNLOADS);
+                android.net.Uri col = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                String relPath = android.os.Environment.DIRECTORY_DOWNLOADS + "/DSHA/";
+                try (android.database.Cursor cur = appContext.getContentResolver().query(
+                        col,
+                        new String[]{android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+                                android.provider.MediaStore.MediaColumns.DATE_MODIFIED},
+                        android.provider.MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                        new String[]{relPath}, null)) {
+                    if (cur != null) {
+                        String bestName = null;
+                        long bestTime = -1;
+                        while (cur.moveToNext()) {
+                            String dn = cur.getString(0);
+                            if (dn == null) continue;
+                            String low = dn.toLowerCase();
+                            if (!low.startsWith("dsha-backup-") && !low.startsWith("dsha-migration-")) continue;
+                            if (!low.endsWith(".tar.gz") && !low.endsWith(".tgz")) continue;
+                            long t = cur.getLong(1);
+                            if (t > bestTime) { bestTime = t; bestName = dn; }
+                        }
+                        if (bestName != null) {
+                            // MediaStore 的 DATE_MODIFIED 是秒；这里只与同单位的值比较。
+                            File f = new File(dirBase, "DSHA/" + bestName);
+                            if (f.isFile() && f.length() > 0) return f;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        // 兜底：老路径直接列目录（已授予「所有文件访问」的设备也能枚举到）
         try {
             File dir = new File(android.os.Environment.getExternalStoragePublicDirectory(
                     android.os.Environment.DIRECTORY_DOWNLOADS), "DSHA");
@@ -3563,6 +3602,7 @@ public class HarnessController {
                 proot.execAndRead("cp -a /root/.dsha-restore-stage/. /root/ 2>/dev/null; "
                         + "rm -rf /root/.dsha-restore-stage; echo DONE");
                 deleteRecursively(stage);
+                syncApiKeyFromRootfs();
                 return "恢复完成（基础模式：整包还原）\n"
                         + "若启动报插件缺失，可到「市场」重新安装该插件。重启 WebUI 生效";
             }
@@ -3582,11 +3622,30 @@ public class HarnessController {
             }
             deleteRecursively(stage);
             invalidateSteps();
+            // issue #22：恢复数据落位后回读备份里的 .dsha-apikey 并回填配置页——
+            // 否则离线包用户（无 .env）走自动/迁移恢复后配置页 key 为空、启动注入空 key。
+            syncApiKeyFromRootfs();
             return (ok ? "恢复完成" : "恢复完成（部分内容已跳过，详见下方）")
                     + (body.isEmpty() ? "" : "\n" + body)
                     + "\n重启 WebUI 生效";
         } catch (Exception e) {
             return "恢复失败: " + e.getMessage();
+        }
+    }
+
+    /** issue #22：把 rootfs 里恢复出的 .dsha-apikey 回填到 App 配置页（与 WorkspaceFragment.doRestore 的手动恢复一致）。
+     *  .env 只在「在线安装」最后一步写，离线包用户恢复后没有它，key 在备份的 .dsh/.dsha-apikey 里。 */
+    private void syncApiKeyFromRootfs() {
+        try {
+            String k = proot.execAndRead("cat /root/.dsh/.dsha-apikey 2>/dev/null");
+            if (k == null) return;
+            k = k.trim();
+            // 只接受形如密钥的值（避免把脚本输出/错误信息当 key 写进配置）
+            if (!k.isEmpty() && !k.contains(" ") && k.length() >= 8) {
+                setApiKey(k);
+                android.util.Log.i("DSHA", "恢复后已从 .dsha-apikey 回填 API key（issue #22）");
+            }
+        } catch (Throwable ignored) {
         }
     }
 
