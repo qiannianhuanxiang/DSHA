@@ -37,6 +37,19 @@
              materialAlertDialogTheme 管 MaterialAlertDialogBuilder。 -->
         <item name="alertDialogTheme">@style/Dialog.DSHA.Alert</item>
         <item name="materialAlertDialogTheme">@style/Dialog.DSHA.Material</item>
+
+        <!-- 关键：Material3 主题会把布局里的 <Button> 自动膨胀成 MaterialButton，
+             而 MaterialButton 的默认样式是 filled —— 它用 backgroundTint=colorPrimary
+             填充背景，**直接忽略 android:background**。
+             结果在深色模式下就是「浅蓝底（primary #7DA7F4）+ 浅灰字
+             （text_secondary #A6B0C3）」，对比度约 1.3:1，根本看不清写了什么。
+             用户实测反馈的正是「设置里 ADB 设备通道的所有按钮」。
+
+             改成 Widget.DSHA.Button：backgroundTint 置空，让各布局自己声明的
+             bg_btn / bg_btn_primary 真正生效。这些 drawable 本身已经带 ripple
+             和禁用态，所以不损失 Material 的交互反馈。
+             一处覆盖，全项目 12+ 个 <Button> 一起修好。 -->
+        <item name="materialButtonStyle">@style/Widget.DSHA.Button</item>
     </style>
 
     <!-- appcompat / framework AlertDialog：必须是完整 Dialog 主题（不能给 Overlay） -->
@@ -60,5 +73,17 @@
     <style name="Shape.DSHA.Dialog" parent="">
         <item name="cornerFamily">rounded</item>
         <item name="cornerSize">@dimen/radius_card</item>
+    </style>
+
+    <!-- 快捷抽屉弹层专用全屏透明主题（无黑边、无白状态栏、左右 100% 满屏无留白） -->
+    <style name="Theme.DeepseekHarness.SheetTransparent" parent="Theme.DeepseekHarness">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackground">@android:color/transparent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
     </style>
 </resources>

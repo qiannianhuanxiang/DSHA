@@ -58,6 +58,8 @@ public class LaunchFragment extends Fragment {
     private boolean enterWhenReady = false;
     private boolean insideWeb = false;
     private String lastLog = "";
+    /** 上一次已经提示过的插件故障结论：日志每 1.5 秒刷一次，别重复往活动日志里写。 */
+    private String lastPluginHint = "";
     /** 日志文件指纹（size+mtime），未变化则跳过重读（每 1.5s 轮询时省一次文件 IO） */
     private long lastLogSize = -1;
     private long lastLogMtime = -1;
@@ -125,9 +127,9 @@ public class LaunchFragment extends Fragment {
         }, "dsha-prewarm").start(), 1500);
 
         startBtn.setOnClickListener(v -> {
-            // 用户主动启动：清除"手动停止"标记（否则 keepAlive/预启动会一直不拉起）
-            requireContext().getSharedPreferences("deepseekharness", android.content.Context.MODE_PRIVATE)
-                    .edit().putBoolean("keepalive_paused", false).apply();
+            // 「手动停止」标记不在这里清 —— HarnessController.startWeb() 开头统一清掉，
+            // 这样通知栏「重启」等别的入口也一样解除，不必每个入口自己记得（漏一个就又
+            // 出现「启动了但保活仍不拉起」这类怪状态）。
             if (webReady) {
                 openWeb();
                 return;
@@ -188,12 +190,44 @@ public class LaunchFragment extends Fragment {
             statusText.setText("环境未就绪。若刚装好 APK，请杀掉进程再打开一次以进入解压页。");
         }
 
+        if (getActivity() != null && getActivity().getIntent() != null) {
+            Intent actIntent = getActivity().getIntent();
+            if (actIntent.getBooleanExtra("open_web", false) || actIntent.getBooleanExtra("auto_enter_web", false)) {
+                enterWhenReady = true;
+            }
+        }
+
         mainHandler.post(tick);
     }
 
-    private void tickOnce() {
+    /** 供通知点击或外部意图唤醒：直接进入 Web 对话界面 */
+    public void enterWebDirectly() {
         if (!isAdded()) return;
-        new Thread(() -> {
+        if (webReady && !insideWeb) {
+            openWeb();
+        } else if (!insideWeb) {
+            enterWhenReady = true;
+            if (!starting && c != null && c.getProot().isOfflineExtracted() && startBtn != null) {
+                startBtn.performClick();
+            }
+        }
+    }
+
+    /**
+     * 心跳间隔：状态还在变的时候要勤，稳定之后没必要。
+     *
+     * <p>原来固定 1.5 秒 —— 也就是说用户停在启动页或 WebUI 里的整段时间，每分钟 40 次
+     * HTTP 探测 + 40 次日志指纹检查。Web 已经起来、人也进去看了的时候，这些只是维持
+     * 状态灯与地址 chip，4 秒一次完全够。而「等启动」那段仍然 1.5 秒：那里的等待秒数要
+     * 走字、就绪后还要自动跳进 WebUI，慢了会被当成卡住。
+     */
+    private long nextTickDelayMs() {
+        if (starting || !webReady) return 1500;   // 还在等启动：保持灵敏
+        return insideWeb ? 4000 : 2500;
+    }
+
+    private void tickOnce() {
+        if (!isAdded()) return;        new Thread(() -> {
             final boolean up = httpOk(uiUrl());
             final String log = readWebLogTail();
             if (!isAdded()) return;
@@ -206,16 +240,34 @@ public class LaunchFragment extends Fragment {
                 webReady = up;
                 applyRunUi(up);
                 refreshHint(); // 每次心跳刷新一次状态行（启动等待期的秒数在这里走字）
+                updateLanAddr(); // 地址 chip 也跟着心跳：局域网后开、WiFi 换网段都能刷新
                 if (up && enterWhenReady && !insideWeb) {
                     enterWhenReady = false;
                     openWeb();
                 }
                 if (!insideWeb && log != null && !log.equals(lastLog)) {
                     lastLog = log;
-                    logText.setText(log.isEmpty() ? "还没有日志。" : log);
+                    // 插件类故障的原始报错基本读不了（一屏栈 + 中间半行插件名），
+                    // 而它恰恰是「Web 打不开」最常见的原因。认出来就把结论摆在日志上方，
+                    // 别让用户对着栈猜、更别让他去清数据重装（有人这么试过，白费）。
+                    String hint = PluginErrorHint.describe(log);
+                    if (!hint.isEmpty()) {
+                        logText.setText(hint + "\n\n———— 原始日志 ————\n" + log);
+                        if (!hint.equals(lastPluginHint)) {
+                            lastPluginHint = hint;
+                            // 记进活动日志：用户过后回想「刚才到底怎么了」还能查到
+                            try {
+                                c.logActivity("Web 启动受阻，疑似插件问题："
+                                        + hint.replace("\n", " "));
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    } else {
+                        logText.setText(log.isEmpty() ? "还没有日志。" : log);
+                    }
                     logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
                 }
-                mainHandler.postDelayed(tick, 1500);
+                mainHandler.postDelayed(tick, nextTickDelayMs());
             });
         }, "dsha-launch-tick").start();
     }
@@ -290,6 +342,7 @@ public class LaunchFragment extends Fragment {
                     gs.open(GeckoRuntime.getDefault(requireContext()));
                     gv.setSession(gs);
                 }
+                attachGeckoDownload(gs);
                 gs.loadUri(uiUrl());
                 return; // GeckoView 加载，不走 WebView
             } catch (Throwable e) {
@@ -322,6 +375,22 @@ public class LaunchFragment extends Fragment {
                         + "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
             }
             webView.setWebViewClient(new WebViewClient());
+            // 系统 WebView 的下载：DownloadListener 只给 URL，得自己再发一次请求。
+            // 产物与 GeckoView 那条路落同一个目录（Download/DSHA/下载/）。
+            webView.setDownloadListener((url, ua, cd, mime, len) -> {
+                final android.content.Context appCtx = requireContext().getApplicationContext();
+                android.widget.Toast.makeText(appCtx, "开始下载…",
+                        android.widget.Toast.LENGTH_SHORT).show();
+                new Thread(() -> {
+                    String name = DownloadSink.guessName(url, cd, "download");
+                    String path = DownloadSink.download(appCtx, url, name, mime);
+                    final String msg = path == null
+                            ? "下载失败：" + name : "已保存到 " + path;
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
+                            android.widget.Toast.makeText(appCtx, msg,
+                                    android.widget.Toast.LENGTH_LONG).show());
+                }).start();
+            });
             webView.setWebChromeClient(new WebChromeClient() {
                 @Override
                 public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
@@ -340,7 +409,7 @@ public class LaunchFragment extends Fragment {
         webView.loadUrl(uiUrl());
     }
 
-    private void closeWeb() {
+    public void closeWeb() {
         if (!insideWeb) return;
         insideWeb = false;
         webPane.setVisibility(View.GONE);
@@ -383,6 +452,53 @@ public class LaunchFragment extends Fragment {
         return base;
     }
 
+    /**
+     * 给 GeckoSession 接上下载。
+     *
+     * <p>GeckoView 对「不能内联显示的响应」默认直接丢弃 —— 从来没设过 ContentDelegate
+     * 的后果就是：WebUI 里点导出/下载什么反应都没有，既不报错也不落文件。产物统一放
+     * {@code Download/DSHA/下载/}。
+     *
+     * <p>响应体必须在后台线程读（主线程读会卡住 UI，大文件直接 ANR）。
+     */
+    private void attachGeckoDownload(GeckoSession gs) {
+        final android.content.Context appCtx = requireContext().getApplicationContext();
+        gs.setContentDelegate(new GeckoSession.ContentDelegate() {
+            @Override
+            public void onExternalResponse(@NonNull GeckoSession session,
+                                           @NonNull org.mozilla.geckoview.WebResponse response) {
+                new Thread(() -> {
+                    String cd = headerOf(response.headers, "Content-Disposition");
+                    String mime = headerOf(response.headers, "Content-Type");
+                    String name = DownloadSink.guessName(response.uri, cd, "download");
+                    String path = null;
+                    try {
+                        if (response.body != null) {
+                            path = DownloadSink.save(appCtx, response.body, name, mime);
+                        }
+                    } catch (Throwable t) {
+                        android.util.Log.w("DSHA", "GeckoView 下载失败: " + t);
+                    }
+                    final String msg = path == null ? "下载失败：" + name : "已保存到 " + path;
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
+                            android.widget.Toast.makeText(appCtx, msg,
+                                    android.widget.Toast.LENGTH_LONG).show());
+                }).start();
+            }
+        });
+    }
+
+    /** HTTP 头名大小写不敏感取值（GeckoView 给的 map 不保证大小写）。 */
+    private static String headerOf(java.util.Map<String, String> headers, String key) {
+        if (headers == null || key == null) return null;
+        String v = headers.get(key);
+        if (v != null) return v;
+        for (java.util.Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getKey() != null && e.getKey().equalsIgnoreCase(key)) return e.getValue();
+        }
+        return null;
+    }
+
     private String uiUrl() {
         String base = "http://127.0.0.1:" + c.getPort() + "/";
         // dsh 的 Web 服务加了 token 鉴权（本机任何 App 都能访问 127.0.0.1，
@@ -392,32 +508,77 @@ public class LaunchFragment extends Fragment {
         return t.isEmpty() ? base : base + "?dsha_t=" + android.net.Uri.encode(t);
     }
 
+    /** 启动页那行可点的地址 chip。
+     *
+     *  <p>用户反馈「启动页给的 URL 用不了，AI 找出来 :3080/?dsha_t=... 才是对的」。
+     *  原因是这里<b>只显示局域网地址</b>（3081），而那条链当时是坏的 ——
+     *  {@code stripTokenFromRequestLine} 把请求行的 HTTP 版本吃掉，后端直接 400。
+     *  用手机自带浏览器打开所需要的本机地址（带 dsh 自己的 {@code dsha_t}）
+     *  从来没有在界面上出现过，用户只能让 agent 去日志里挖。
+     *
+     *  <p>现在一行 chip 收两个入口，点开再选本机 / 同 WiFi。另外它以前只在
+     *  onViewCreated 算一次 —— 局域网后来才开、或者 WiFi 换了网段都不会刷新，
+     *  现在跟着心跳走。 */
     private void updateLanAddr() {
+        if (!webReady) {
+            lanAddrText.setVisibility(View.GONE);
+            return;
+        }
+        lanAddrText.setText("在浏览器中打开 ▸ 点这里取地址（本机 / 同 WiFi）");
+        lanAddrText.setVisibility(View.VISIBLE);
+        lanAddrText.setOnClickListener(v -> showBrowserAddrDialog());
+    }
+
+    /** 列出可用的浏览器访问地址。地址里的 token 就是凭据，所以复制后要提醒一句。 */
+    private void showBrowserAddrDialog() {
+        final String local = uiUrl();
         boolean lan = requireContext()
                 .getSharedPreferences("deepseekharness", android.content.Context.MODE_PRIVATE)
                 .getBoolean("lan_mode", false);
-        if (!lan) {
-            lanAddrText.setVisibility(View.GONE);
-            return;
-        }
         String ip = HarnessController.getLanAddress();
-        if (ip == null) {
-            lanAddrText.setVisibility(View.GONE);
-            return;
+        final String lanAddr = (lan && ip != null && !ip.isEmpty())
+                ? "http://" + ip + ":" + LanProxyService.LAN_PORT + "/?token="
+                        + LanProxyService.getLanToken(requireContext())
+                : null;
+
+        final java.util.List<String> items = new java.util.ArrayList<>();
+        final java.util.List<Runnable> acts = new java.util.ArrayList<>();
+
+        items.add("用本机浏览器打开\n" + local);
+        acts.add(() -> AboutDialog.openBrowser(requireContext(), local));
+        items.add("复制本机地址");
+        acts.add(() -> copyAddr("本机地址", local));
+        if (lanAddr != null) {
+            items.add("复制局域网地址（同 WiFi 的其它设备用）\n" + lanAddr);
+            acts.add(() -> copyAddr("局域网地址", lanAddr));
+        } else if (lan) {
+            items.add("局域网已开启，但还没拿到 WiFi 地址（连上 WiFi 再看）");
+            acts.add(() -> { });
+        } else {
+            items.add("局域网访问未开启 —— 去「配置」页打开后再来取地址");
+            acts.add(() -> { });
         }
-        // 注意：局域网访问走 App 侧 LanProxyService 桥（端口 3081 → 后端 3080），
-        // 不是直连 3080（直连需要 lan-bind 补丁成功且 CLI 放行 0.0.0.0，不可靠）
-        // LAN 访问带 token（鉴权：防同 WiFi 任意设备访问 dsh）
-        final String lanTok = LanProxyService.getLanToken(requireContext());
-        final String copyAddr = "http://" + ip + ":" + LanProxyService.LAN_PORT + "/?token=" + lanTok;
-        lanAddrText.setText("局域网访问: " + copyAddr + "  （同 WiFi 设备可打开）");
-        lanAddrText.setVisibility(View.VISIBLE);
-        lanAddrText.setOnClickListener(v -> {
+
+        new androidx.appcompat.app.AlertDialog.Builder(requireContext())
+                .setTitle("在浏览器中打开")
+                .setItems(items.toArray(new String[0]), (d, which) -> {
+                    if (which >= 0 && which < acts.size()) acts.get(which).run();
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    private void copyAddr(String label, String addr) {
+        try {
             android.content.ClipboardManager cm = (android.content.ClipboardManager)
                     requireContext().getSystemService(android.content.Context.CLIPBOARD_SERVICE);
-            cm.setPrimaryClip(android.content.ClipData.newPlainText("lan", copyAddr));
-            Toast.makeText(requireContext(), "局域网地址已复制", Toast.LENGTH_SHORT).show();
-        });
+            if (cm != null) cm.setPrimaryClip(android.content.ClipData.newPlainText(label, addr));
+            // token 就写在地址里，等于密码 —— 说清楚，别让人随手发到群里
+            Toast.makeText(requireContext(), label + "已复制（里面的 token 相当于密码，别外发）",
+                    Toast.LENGTH_LONG).show();
+        } catch (Throwable e) {
+            Toast.makeText(requireContext(), "复制失败：" + addr, Toast.LENGTH_LONG).show();
+        }
     }
 
     private boolean goExtractIfNeeded() {

@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.widget.Toast;
 
 import androidx.core.app.NotificationCompat;
 
@@ -52,6 +53,15 @@ public final class HttpShellService {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile CountDownLatch pendingLatch;
     private volatile boolean pendingAllow;
+    /** 本轮确认是否已被认领：三条渠道（通知 / 弹窗 / 悬浮条）谁先点谁生效。
+     *
+     *  <p>没有它的时候，「检查 latch 未决 → 写 pendingAllow → countDown」这三步不是原子的：
+     *  两条渠道几乎同时被点（悬浮条点了没反应又去点通知，或纯误触），两个线程都能通过
+     *  {@code getCount() == 0} 的检查，于是后到的那个会把 pendingAllow 覆盖掉 ——
+     *  等待线程读到的是后写入的值。表现是<b>授权语义反转</b>：点「允许」却被拒绝，
+     *  更糟的是点「拒绝」而另一条渠道的「允许」后到，命令照样执行。 */
+    private final java.util.concurrent.atomic.AtomicBoolean confirmResolved =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     /** 确认进行中标志：并发确认请求直接拒绝（避免 latch 覆盖导致"点了允许却拒绝"）。
      *  用 AtomicBoolean 而非 volatile boolean —— "检查后置位"必须原子，
      *  否则两个请求线程可能同时通过检查、互相覆盖 pendingLatch。（吸收上游 PR#24） */
@@ -64,10 +74,16 @@ public final class HttpShellService {
             new java.util.concurrent.atomic.AtomicLong();
     /** 当前挂起的弹窗：setCancelable(false) 后它自己关不掉，确认完必须主动 dismiss */
     private volatile androidx.appcompat.app.AlertDialog pendingDialog;
-    /** /app/ask 的一次性问答状态（同一时刻只允许一个提问在等待） */
-    private volatile CountDownLatch askLatch;
+    /** /app/ask 的一次性问答状态（支持前台弹窗与通知栏快捷按钮双通道同步回答）。 */
+    private final java.util.concurrent.atomic.AtomicLong askEpoch =
+            new java.util.concurrent.atomic.AtomicLong();
+    private volatile androidx.appcompat.app.AlertDialog pendingAskDialog;
+    private volatile CountDownLatch pendingAskLatch;
+    private final java.util.concurrent.atomic.AtomicBoolean askResolved =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile String askAnswer = "";
-    private volatile boolean askBusy = false;
+    private final java.util.concurrent.atomic.AtomicBoolean askBusy =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private ServerSocket server;
     /** IPv6 回环监听（兼容脚本用 localhost 解析成 ::1 的场景；绑不上则忽略） */
@@ -89,9 +105,29 @@ public final class HttpShellService {
         return instance;
     }
 
+    /** 桥还没启动过时的兜底 Context。
+     *
+     *  <p>{@link #tokenFileIfPossible()} 原先只从 {@code instance().ctx} 取 Context，
+     *  于是桥没启动过时（比如用户把「设备桥」和「悬浮条」都关着）它返回 null，
+     *  {@link #ensureToken()} 只改内存、**静默不写文件**。自检因此谎报「已重新写入」，
+     *  而容器侧 selftest 同时报「缺 .bridge_token」—— 两份报告自相矛盾，真机上出现过。 */
+    private static volatile Context tokenCtx;
+
+    /** 自检、恢复备份这类在桥启动前就要对齐 token 的场合，先把 Context 交给它。 */
+    static void bindTokenContext(Context ctx) {
+        if (ctx != null) tokenCtx = ctx.getApplicationContext();
+    }
+
     private static java.io.File tokenFileIfPossible() {
+        Context c = null;
         try {
-            HarnessController hc = HarnessController.get(instance().ctx);
+            c = instance().ctx;
+        } catch (Throwable ignored) {
+        }
+        if (c == null) c = tokenCtx;
+        if (c == null) return null;
+        try {
+            HarnessController hc = HarnessController.get(c);
             if (hc != null && hc.getProot() != null && hc.getProot().getRootfsDir() != null) {
                 return new java.io.File(hc.getProot().getRootfsDir(), "root/.dsh/.bridge_token");
             }
@@ -242,7 +278,12 @@ public final class HttpShellService {
         while (running) {
             try {
                 Socket client = ss.accept();
-                client.setSoTimeout(120_000);
+                // 读超时 15 秒（原来 120 秒）。这个超时只管「读请求头」这一段 ——
+                // 命令执行与等用户点确认期间并不 read，不受影响。
+                // 而池子只有 4 个线程：同一台手机上任何 App 都能连 loopback，
+                // 4 个「连上不说话」的连接就能让桥停摆两分钟，agent 的确认弹窗和
+                // 命令全部超时。请求头 15 秒到不齐的客户端本来也不正常。
+                client.setSoTimeout(15_000);
                 java.util.concurrent.ExecutorService p = pool;
                 if (p == null) {
                     try { client.close(); } catch (IOException ignored) { }
@@ -294,20 +335,42 @@ public final class HttpShellService {
         }
     }
 
-    private static boolean tokenMatch(String presented) {
-        String token = authToken.isEmpty() ? ensureToken() : authToken;
-        return token != null && !token.isEmpty() && constantTimeEquals(token, presented);
+    /** 自检用：当前内存里的桥 token 快照（空串 = 桥还没起来过）。
+     *  故意不触发生成 —— 自检本身不该有副作用，写文件那是
+     *  {@link #resetTokenAfterRestore()} 的活儿。 */
+    static String tokenSnapshot() {
+        return authToken == null ? "" : authToken;
     }
 
-    private static boolean constantTimeEquals(String a, String b) {
-        if (a == null || b == null) return false;
-        int diff = a.length() ^ b.length();
-        for (int i = 0; i < a.length(); i++) {
-            char ca = a.charAt(i);
-            char cb = i < b.length() ? b.charAt(i) : 0;
-            diff |= ca ^ cb;
+    /** 恢复备份后重新对齐 3090 桥的 token。
+     *
+     *  <p>老备份包里带着**备份那台机器**的 {@code .dsh/.bridge_token}（新版备份已经把它
+     *  排除了）。恢复出来之后 rootfs 里是旧 token，而 App 进程内的 {@link #authToken}
+     *  还是当前那个 —— 它是静态字段，{@link #ensureToken()} 只在缓存为空时才读文件。
+     *  于是 App 用自己的 token 拼 WebView 首帧 URL，dsh 后端却按恢复出来的旧 token 校验，
+     *  用户看到的就是「DSHA：需要 token，请在 DSHA 应用内打开，或在 URL 后加 ?dsha_t=…」。
+     *
+     *  <p>处理：删掉恢复出来的 token 文件、清空内存缓存，再让 ensureToken 重新生成并写回，
+     *  两侧重新对齐。dsh 后端自己也缓存了 token（webserver-auth-patch 里的
+     *  {@code __dshaTokenCache}），所以要重启 Web 才彻底生效 —— 恢复流程本来就提示重启。 */
+    public static void resetTokenAfterRestore() {
+        try {
+            java.io.File tf = tokenFileIfPossible();
+            if (tf != null && tf.isFile()) {
+                //noinspection ResultOfMethodCallIgnored
+                tf.delete();
+            }
+            authToken = "";
+            ensureToken();
+            android.util.Log.i("DSHA", "恢复后已重置 3090 桥 token（老备份里带的是别的机器的）");
+        } catch (Throwable e) {
+            android.util.Log.w("DSHA", "恢复后重置桥 token 失败: " + e);
         }
-        return diff == 0;
+    }
+
+    private static boolean tokenMatch(String presented) {
+        String token = authToken.isEmpty() ? ensureToken() : authToken;
+        return token != null && !token.isEmpty() && LanAuth.constantTimeEquals(token, presented);
     }
 
     private void handle(Socket client) {
@@ -319,36 +382,35 @@ public final class HttpShellService {
             String path = parts.length > 1 ? parts[1] : "/";
             String cmd = "";
             if (path.startsWith("/exec") || path.startsWith("/confirm")) {
-                int q = path.indexOf("cmd=");
-                if (q >= 0) {
-                    // 关键：cmd= 值要截断到 &（查询串可能有多个参数，如
-                    // /exec?cmd=ls&token=xxx）。旧实现 substring(q+4) 取到末尾，
-                    // cmd 会变成 "ls&token=xxx" → 执行错命令！
-                    String cv = path.substring(q + 4);
-                    int amp = cv.indexOf('&');
-                    if (amp >= 0) cv = cv.substring(0, amp);
-                    cmd = URLDecoder.decode(cv, "UTF-8");
-                }
+                // 走统一的查询串解析（Query.param）：值要截断到 &，参数名要精确匹配。
+                // 旧实现是 path.indexOf("cmd=") —— 值截断修过了，但参数名边界一直没有，
+                // 于是 ?xcmd=junk&cmd=真命令 会取到 junk。/confirm 的 cmd 是<b>给用户看的
+                // 命令原文</b>，取错就等于让用户批准了一条与实际不符的命令。
+                cmd = getParam(queryOf(path), "cmd", "");
             }
             // 鉴权：token 必须匹配（通过 ?token= 或 X-Token header）
             boolean authed = false;
             String t = "";
-            // 只认 query 中的 token（EXCLUSIVE：跳过 path 其他位置的 token=）
-            int qm = path.indexOf('?');
-            String query = qm >= 0 ? path.substring(qm + 1) : "";
-            int tq = query.indexOf("token=");
-            if (tq >= 0) {
-                t = query.substring(tq + 6);
-                int amp = t.indexOf('&');
-                if (amp >= 0) t = t.substring(0, amp);
-                try { t = URLDecoder.decode(t, "UTF-8"); } catch (Exception ignored) { }
-                if (!t.isEmpty()) authed = tokenMatch(t.trim());
+            // 解析与 LanProxyService 共用 LanAuth 那一份。原来这里是
+            // query.indexOf("token=")，没有参数名边界：?xtoken=junk&token=真值
+            // 会先命中 xtoken= 取到 junk 而误拒。两处各写一套判断正是本项目
+            // 反复栽的模式，合并后由 tools/pure-logic-test.sh 一起覆盖。
+            String qt = LanAuth.queryTokenFromTarget(path);
+            if (qt != null && !qt.isEmpty()) {
+                try { qt = URLDecoder.decode(qt, "UTF-8"); } catch (Exception ignored) { }
+                t = qt;
+                authed = tokenMatch(qt.trim());
             }
             if (!authed) {
                 // 也支持 header 传 token（agent 引导用 curl -H）
                 try {
                     String hdr;
+                    int lines = 0;
                     while ((hdr = reader.readLine()) != null && !hdr.isEmpty()) {
+                        // 桥绑在 loopback，但同一台手机上任何 App 都能连 loopback。
+                        // 池子只有 4 个线程 —— 不设上限的话，一个只管发头不发空行的
+                        // 连接就能占住一个线程直到读超时。行数封顶 + 下面的读超时兜底。
+                        if (++lines > 64) break;
                         if (hdr.toLowerCase().startsWith("x-token:")) {
                             String hv = hdr.substring(8).trim();
                             if (!hv.isEmpty() && tokenMatch(hv)) authed = true;
@@ -361,6 +423,10 @@ public final class HttpShellService {
             String result;
             if (!authed) {
                 result = "[UNAUTHORIZED]";
+            } else if (path.startsWith("/app/task/running")) {
+                result = appTaskRunning(path);
+            } else if (path.startsWith("/app/task/cancel")) {
+                result = appTaskCancel();
             } else if (path.startsWith("/app/notify")) {
                 // agent 通过 App 发通知栏提醒（App 层交互）
                 result = appNotify(path);
@@ -390,6 +456,26 @@ public final class HttpShellService {
                 result = appVibrate(path);
             } else if (path.startsWith("/app/ask")) {
                 result = appAsk(path);
+            } else if (path.startsWith("/app/version")) {
+                result = appVersion();
+            } else if (path.startsWith("/app/help")) {
+                result = appHelp();
+            } else if (path.startsWith("/app/plugins")) {
+                result = appPlugins(path);
+            } else if (path.startsWith("/app/overlay")) {
+                result = appOverlay(path);
+            } else if (path.startsWith("/app/location")) {
+                // 位置 / 传感器 / 手电：手机相对服务器真正独有的那几样能力。
+                // 顺序要紧 —— /app/sensors 必须在 /app/sensor 之前判，
+                // 否则 startsWith 会让「列表」被「读单个」抢走。
+                result = DeviceSense.location(ctx, "1".equals(getParam(queryOf(path), "fresh", "")));
+            } else if (path.startsWith("/app/sensors")) {
+                result = DeviceSense.sensorList(ctx);
+            } else if (path.startsWith("/app/sensor")) {
+                result = DeviceSense.sensorRead(ctx, getParam(queryOf(path), "name", "light"));
+            } else if (path.startsWith("/app/torch")) {
+                String on = getParam(queryOf(path), "on", "1");
+                result = DeviceSense.torch(ctx, !"0".equals(on) && !"off".equalsIgnoreCase(on));
             } else if (path.startsWith("/app/export")) {
                 result = appExport(path);
             } else if (cmd.isEmpty()) {
@@ -427,29 +513,60 @@ public final class HttpShellService {
     /** /app/notify?title=&text= ：发通知栏提醒 */
     private String appNotify(String path) {
         try {
-            // App 前台时不发通知（用户正看着页面，不打扰）——与 TaskNotifier 抑制一致
-            if (TaskNotifier.appInForeground) return "FOREGROUND_SKIP";
             String q = queryOf(path);
             String title = getParam(q, "title", "DSHA 通知");
             String text = getParam(q, "text", "");
             if (text.isEmpty()) return "NO_TEXT";
+
+            // 任务结束，清除运行中状态通知
+            cancelRunningNotification();
+
+            // 1. 先走通知：写入「任务结果与交互」独立通道，挂载 RemoteInput 继续对话输入组件
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm == null) return "NO_SERVICE";
-            if (Build.VERSION.SDK_INT >= 26) {
-                NotificationChannel ch = new NotificationChannel(
-                        "dsh_agent_channel", "Agent 通知",
-                        NotificationManager.IMPORTANCE_HIGH);
-                ch.setDescription("智能体通过 App 发送的通知");
-                nm.createNotificationChannel(ch);
+            if (nm != null) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    NotificationChannel ch = new NotificationChannel(
+                            Constants.CHANNEL_TASK_RESULT, "任务结果与交互",
+                            NotificationManager.IMPORTANCE_HIGH);
+                    ch.setDescription("智能体任务完成、异常结束或终止时的结果通知");
+                    nm.createNotificationChannel(ch);
+                }
+
+                Intent openAppIntent = new Intent(ctx, QuickChatSheetActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                PendingIntent contentPi = PendingIntent.getActivity(ctx, 20, openAppIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                // 点击「💬 继续对话」直接从屏幕底部唤起抽屉弹层
+                Intent actionIntent = new Intent(ctx, QuickChatSheetActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                PendingIntent actionPi = PendingIntent.getActivity(ctx, 25, actionIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                NotificationCompat.Action replyAction = new NotificationCompat.Action.Builder(
+                        R.drawable.ic_launch, "💬 继续对话", actionPi)
+                        .build();
+
+                NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, Constants.CHANNEL_TASK_RESULT)
+                        .setSmallIcon(R.drawable.ic_launch)
+                        .setContentTitle(title)
+                        .setContentText(text)
+                        .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+                        .setContentIntent(contentPi)
+                        .addAction(replyAction)
+                        .setPriority(NotificationCompat.PRIORITY_HIGH)
+                        .setAutoCancel(true);
+                nm.notify(Constants.NOTIF_TASK, b.build());
             }
-            NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, "dsh_agent_channel")
-                    .setSmallIcon(R.drawable.ic_launch)
-                    .setContentTitle(title)
-                    .setContentText(text)
-                    .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
-                    .setPriority(NotificationCompat.PRIORITY_HIGH)
-                    .setAutoCancel(true);
-            nm.notify(2002, b.build());
+
+            // 2. 再走 Toast：若 App 处于前台，弹出友好 Toast 提示用户（不阻断通知栏卡片）
+            if (TaskNotifier.appInForeground) {
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    try {
+                        Toast.makeText(ctx, "✓ " + title + "：" + (text.length() > 30 ? text.substring(0, 30) + "…" : text), Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {}
+                });
+            }
+
             return "OK";
         } catch (Throwable e) {
             return "ERROR: " + e.getMessage();
@@ -492,22 +609,65 @@ public final class HttpShellService {
         return false;
     }
 
+    private static java.io.File authLeaseFileIfPossible() {
+        Context c = null;
+        try {
+            c = instance().ctx;
+        } catch (Throwable ignored) {
+        }
+        if (c == null) c = tokenCtx;
+        if (c == null) return null;
+        try {
+            HarnessController hc = HarnessController.get(c);
+            if (hc != null && hc.getProot() != null && hc.getProot().getRootfsDir() != null) {
+                return new java.io.File(hc.getProot().getRootfsDir(), "root/.dsh/.auth_lease");
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     /** @param action 给用户看的具体动作描述 —— 弹窗必须说清 AI 要干什么，
      *               而不是笼统一句「操作屏幕」，否则用户等于盲签。 */
     private boolean uiAuthorized(String action) {
         String pkg = DshaAccessibilityService.currentPackage();
         boolean sensitive = isSensitiveApp(pkg);
-        if (!sensitive && System.currentTimeMillis() < uiGrantUntil) {
-            return true;
+        long now = System.currentTimeMillis();
+        if (!sensitive) {
+            if (now < uiGrantUntil) {
+                return true;
+            }
+            java.io.File lf = authLeaseFileIfPossible();
+            if (lf != null && lf.isFile()) {
+                try {
+                    String s = new String(java.nio.file.Files.readAllBytes(lf.toPath()),
+                            java.nio.charset.StandardCharsets.UTF_8).trim();
+                    double expSec = Double.parseDouble(s);
+                    if (now / 1000.0 < expSec) {
+                        uiGrantUntil = (long) (expSec * 1000L);
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
         }
         String where = pkg.isEmpty() ? "当前界面" : pkg;
         String why = sensitive
                 ? "在【" + where + "】里：" + action
                 + "  # 这类应用涉及支付或隐私，每次都需要你确认"
-                : action + "  # 允许后 10 分钟内的屏幕操作不再询问";
+                : action + "  # 允许后 10 分钟内的屏幕与设备操作不再询问";
         boolean ok = requestUserConfirm(why);
         if (ok && !sensitive) {
-            uiGrantUntil = System.currentTimeMillis() + UI_GRANT_MS;
+            long grantExp = now + UI_GRANT_MS;
+            uiGrantUntil = grantExp;
+            java.io.File lf = authLeaseFileIfPossible();
+            if (lf != null) {
+                try {
+                    java.nio.file.Files.write(lf.toPath(),
+                            String.valueOf(grantExp / 1000.0).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                } catch (Throwable ignored) {
+                }
+            }
         }
         return ok;
     }
@@ -581,6 +741,268 @@ public final class HttpShellService {
         } catch (Exception e) {
             return def;
         }
+    }
+
+    /**
+     * {@code /app/overlay?session=&kind=delta|tool|text|done|clear&text=} ——
+     * 把 agent 正在生成的内容送到屏幕顶部的流式悬浮条（{@link OverlayController}）。
+     *
+     * <p>返回值刻意分三种，让插件侧能自己降级：{@code DISABLED}（用户没开这个功能）、
+     * {@code NO_PERMISSION}（没给悬浮窗权限）、{@code OK}。插件拿到前两种就该停止推送 ——
+     * 流式增量是高频调用，白发一路 HTTP 纯属烧电。
+     */
+    /**
+     * {@code /app/plugins}：让 dsh 进程内的插件把<b>真实加载状态</b>报给 App，
+     * 也可以只读回上一次上报。
+     *
+     * <p><b>为什么要走桥，而不是 App 自己读文件</b>：App 只能读 profile 的 package.json
+     * 猜「注册了没有」，而<b>注册了不等于加载成功</b> —— 入口文件缺失、inject 的服务不存在、
+     * patch 里的 name 与目标行对不上，都会让插件静静地不生效，而 package.json 看起来一切正常。
+     * 只有跑在 dsh 进程里的插件能通过 cordis 上下文看到真实状态。这正是「插件装了没反应」
+     * 一直缺的那份证据 —— 缺了它，App 只能猜，用户只能重装。
+     *
+     * <p>约定：
+     * <ul>
+     *   <li>{@code ?loaded=a,b&failed=c}（逗号分隔）→ 上报，存起来给插件页与自检用；</li>
+     *   <li>不带参数 → 只读，返回 {@code LOADED:… / FAILED:… / AT:<毫秒时间戳>}。</li>
+     * </ul>
+     */
+    /**
+     * {@code /app/help}：3090 桥的完整端点清单，纯文本、给 agent 读。
+     *
+     * <p><b>为什么要有这个端点</b>：这份清单原来整份写在 device-shell-guide 的注入提示词里
+     * （12KB，约几千 token），而它是<b>每一轮对话都要付的成本</b> —— 哪怕这轮根本不碰设备。
+     * 挪到运行时按需查之后，提示词只留骨架，agent 要用设备能力时 curl 一次就拿到全部细节。
+     *
+     * <p>还有个额外好处：这份清单跟端点实现<b>在同一个文件里</b>，加端点时顺手就更新了；
+     * 写在插件的提示词里则要改 assets、bump 版本、重签清单，于是必然脱节
+     * （AGENTS.md 里「文档说 14 个端点、实际 26 个」就是这么来的）。
+     */
+    /**
+     * 桥协议版本 —— 插件侧靠它判断「这台 App 支持哪些端点」。
+     *
+     * <p><b>什么时候该涨</b>（写清楚，否则这个号形同虚设）：
+     * <ul>
+     *   <li><b>加新端点：不涨。</b>老插件不知道新端点，行为不变；新插件想用新端点，
+     *       自己 try 一下拿 404 就知道了；</li>
+     *   <li><b>改已有端点的参数含义、返回格式，或删端点：涨。</b>这类改动会让按老约定
+     *       写的插件静默拿到错东西 —— 那正是版本号要挡的事。</li>
+     * </ul>
+     *
+     * <p>所以插件的正确写法是 {@code if (protocol >= N)} 而不是 {@code == N}。
+     */
+    private static final int BRIDGE_PROTOCOL = 1;
+
+    /**
+     * {@code /app/version}：桥协议与 App 版本，给插件做特性检测。
+     *
+     * <p>没有这个端点时，插件只能靠「试着调一下看会不会 404」来猜 App 的能力，
+     * 而 dsh 与 DSHA 是各自升级的 —— 用户完全可能拿新插件配旧 App。
+     */
+    private String appVersion() {
+        return "BRIDGE_PROTOCOL=" + BRIDGE_PROTOCOL + "\n"
+                + "APP_VERSION=" + BuildConfig.VERSION_NAME + "\n"
+                + "APP_CODE=" + BuildConfig.VERSION_CODE + "\n"
+                + "HINT=端点清单见 /app/help；判版本请用 >= 而不是 ==\n";
+    }
+
+    private String appHelp() {
+        return "DSHA 3090 桥端点清单（BRIDGE_PROTOCOL=" + BRIDGE_PROTOCOL + "）\n"
+            + "token 取自 /root/.dsh/.bridge_token，下面记为 $T。\n"
+            + "带中文/空格的参数一律用 -G --data-urlencode，别手写 URL 编码。\n"
+            + "\n"
+            + "== 屏幕操作（无障碍服务，不需要 ADB/Shizuku）==\n"
+            + "读屏  curl -s \"127.0.0.1:3090/app/ui/dump?token=$T\"\n"
+            + "      → 每行「[序号] \"文字\" 可点击 中心=(x,y) 区域=l,t,r,b」\n"
+            + "点按  curl -s -G 127.0.0.1:3090/app/ui/tap --data-urlencode \"text=设置\" --data-urlencode \"token=$T\"\n"
+            + "      → 优先按文字点：控件位置随滚动/动画变，文字不变。没有文字才用 ?x=&y=\n"
+            + "输入  curl -s -G 127.0.0.1:3090/app/ui/input --data-urlencode \"text=内容\" --data-urlencode \"token=$T\"\n"
+            + "      → 填到当前焦点框；没有焦点先 tap 一下输入框\n"
+            + "按键  /app/ui/key?name=back  （back/home/recents/notifications/quicksettings/lock）\n"
+            + "滑动  /app/ui/swipe?x1=500&y1=1500&x2=500&y2=500&ms=300\n"
+            + "截屏  /app/ui/screenshot   → 存 PNG 到 Download/DSHA 并返回路径（不回 base64）\n"
+            + "节奏：每次点按/输入后先 dump 再决定下一步，别凭记忆连点。\n"
+            + "\n"
+            + "== 设备与应用 ==\n"
+            + "/app/device                     机型/系统/电量/网络/屏幕/存储/内存\n"
+            + "/app/apps?q=微信&limit=50       已装应用（默认只列第三方）\n"
+            + "/app/launch?pkg=com.tencent.mm  启动应用\n"
+            + "/app/clip                       读剪贴板（需 App 在前台，系统限制）\n"
+            + "/app/clip + text=…              写剪贴板\n"
+            + "/app/readfile?path=/sdcard/…    读外部文件\n"
+            + "/sdcard 已挂载，Download / DCIM 等公共目录可直接读写\n"
+            + "\n"
+            + "== 与用户交互 ==\n"
+            + "/app/ask?options=继续|取消 + q=…  弹窗阻塞等回答（最多三个选项）\n"
+            + "/app/notify?title=… + text=…      通知栏\n"
+            + "/app/toast + text=…               App 内提示\n"
+            + "/app/vibrate?ms=300               震动（长任务跑完叫醒用户）\n"
+            + "/app/share（text= 或 path=）      分享到其它应用\n"
+            + "/app/open?url=https://…           打开链接\n"
+            + "/app/export?path=/root/report.md  把产物交给用户 → 落 Download/DSHA\n"
+            + "建议：需要用户拍板用 /app/ask 而不是干等；长任务结束用 notify 或 vibrate 叫人；\n"
+            + "产出报告用 /app/export，别只留在容器里。\n"
+            + "\n"
+            + "== 传感器与位置（默认关闭，需用户在配置页勾选）==\n"
+            + "/app/location（加 fresh=1 强制重新定位，可能等数秒）\n"
+            + "/app/sensors 列表 · /app/sensor?name=light 读值\n"
+            + "（light 环境光 lux / accel / gyro / magnet / pressure / proximity /\n"
+            + " gravity / rotation 姿态四元数 / steps 开机后步数）\n"
+            + "/app/torch?on=1 手电\n"
+            + "这三类返回 DISABLED（用户没开该能力）或 NO_PERMISSION（没授系统权限）时，\n"
+            + "照原话告诉用户去哪开，不要重试 —— 重试不会让开关自己变。\n"
+            + "\n"
+            + "== 元信息 ==\n"
+            + "/app/version                          桥协议版本 + App 版本（特性检测用）\n"
+            + "/app/help                             本清单\n"
+            + "\n"
+            + "== 插件状态 ==\n"
+            + "/app/plugins                          读回上次上报的加载状态\n"
+            + "/app/plugins?loaded=a,b&failed=c      上报（插件侧用）\n"
+            + "\n"
+            + "== 设备 shell（ADB 无线调试，用户可能没开）==\n"
+            + "/root/dsh-bin/adb-shell \"命令\"        shell 级（uid=2000）\n"
+            + "包装命令不存在时：python3 /root/.dsh/adb-shell.py \"命令\"\n"
+            + "报连不上/未配对：先看上面的 App 层接口能不能办成；确实必须 shell 才请用户到\n"
+            + "「配置」页开「ADB 设备通道」并配对，别反复试同一条命令。\n"
+            + "不要用 /root/dsh-bin/adb 或裸 adb —— 那是守卫包装脚本，会失败。\n"
+            + "\n"
+            + "== root（--su）==\n"
+            + "默认权限是 shell 级（uid=2000，非 root）。不要主动用 --su；\n"
+            + "只有用户明确要求 root 操作时才尝试，且要先请他到「配置」页勾选「允许 root shell」。\n";
+    }
+
+    private String appPlugins(String path) {
+        try {
+            String q = queryOf(path);
+            String loaded = getParam(q, "loaded", null);
+            String failed = getParam(q, "failed", null);
+            android.content.SharedPreferences sp =
+                    ctx.getSharedPreferences("deepseekharness", Context.MODE_PRIVATE);
+            if (loaded == null && failed == null) {
+                return "LOADED:" + sp.getString("plugin_loaded", "")
+                        + "\nFAILED:" + sp.getString("plugin_failed", "")
+                        + "\nAT:" + sp.getLong("plugin_report_ts", 0L);
+            }
+            sp.edit()
+                    .putString("plugin_loaded", loaded == null ? "" : loaded.trim())
+                    .putString("plugin_failed", failed == null ? "" : failed.trim())
+                    .putLong("plugin_report_ts", System.currentTimeMillis())
+                    .apply();
+            // 有加载失败的就写进活动日志 —— 那是用户唯一能看到「插件为什么没反应」的地方
+            if (failed != null && !failed.trim().isEmpty()) {
+                try {
+                    HarnessController.get(ctx).logActivity("插件加载失败：" + failed.trim());
+                } catch (Throwable ignored) {
+                }
+            }
+            return "OK";
+        } catch (Throwable e) {
+            return "ERROR: " + e;
+        }
+    }
+
+    private String appOverlay(String path) {
+        try {
+            String q = queryOf(path);
+            String kind = getParam(q, "kind", "delta");
+            String text = getParam(q, "text", "");
+            String session = getParam(q, "session", "");
+
+            // 通知栏同步实时运行状态与「🛑 停止任务」紧急制动按钮
+            if ("tool".equals(kind) || "text".equals(kind)) {
+                if (!text.trim().isEmpty()) {
+                    showRunningNotification(text);
+                }
+            } else if ("done".equals(kind) || "clear".equals(kind)) {
+                cancelRunningNotification();
+            }
+
+            if (!OverlayController.enabled(ctx)) return "DISABLED";
+            if (!OverlayController.permitted(ctx)) return "NO_PERMISSION";
+            // 让插件知道用户想不想看这两类内容，省得白发一路 HTTP
+            if ("reasoning".equals(kind) && !OverlayController.showReasoning(ctx)) {
+                return "SKIP_REASONING";
+            }
+            OverlayController.push(ctx, session, kind, text);
+            return OverlayController.showCommand(ctx) ? "OK" : "OK_NO_CMD";
+        } catch (Throwable e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private String appTaskRunning(String path) {
+        try {
+            String q = queryOf(path);
+            String title = getParam(q, "title", "DSHA · 正在执行");
+            String text = getParam(q, "text", "智能体正在执行自动化任务...");
+            showRunningNotification(title, text);
+            return "OK";
+        } catch (Throwable e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private String appTaskCancel() {
+        try {
+            cancelRunningNotification();
+            return "OK";
+        } catch (Throwable e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private void showRunningNotification(String text) {
+        showRunningNotification("DSHA · 正在执行", text);
+    }
+
+    private void showRunningNotification(String title, String text) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                NotificationChannel ch = new NotificationChannel(
+                        Constants.CHANNEL_AGENT_RUNNING, "Agent 运行状态",
+                        NotificationManager.IMPORTANCE_HIGH);
+                ch.setDescription("智能体运行中实时操作步骤通知");
+                NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (nm != null) nm.createNotificationChannel(ch);
+            }
+
+            Intent openAppIntent = new Intent(ctx, QuickChatSheetActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent contentPi = PendingIntent.getActivity(ctx, 110, openAppIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+            Intent stopIntent = new Intent(ctx, ConfirmReceiver.class)
+                    .setAction(ConfirmReceiver.ACTION_STOP_TASK);
+            PendingIntent stopPi = PendingIntent.getBroadcast(ctx, 111, stopIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+            NotificationCompat.Action stopAction = new NotificationCompat.Action.Builder(
+                    R.drawable.ic_launch, "🛑 停止任务", stopPi)
+                    .build();
+
+            String shortMsg = (text == null || text.trim().isEmpty()) ? "智能体正在执行自动化任务..." : shortText(text);
+
+            NotificationCompat.Builder nb = new NotificationCompat.Builder(ctx, Constants.CHANNEL_AGENT_RUNNING)
+                    .setSmallIcon(R.drawable.ic_launch)
+                    .setContentTitle(title != null && !title.isEmpty() ? title : "DSHA · 正在执行")
+                    .setContentText(shortMsg)
+                    .setStyle(new NotificationCompat.BigTextStyle().bigText(text != null && !text.isEmpty() ? text : shortMsg))
+                    .setContentIntent(contentPi)
+                    .addAction(stopAction)
+                    .setOngoing(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH);
+
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(Constants.NOTIF_TASK_RUNNING, nb.build());
+        } catch (Throwable ignored) {}
+    }
+
+    private void cancelRunningNotification() {
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(Constants.NOTIF_TASK_RUNNING);
+        } catch (Throwable ignored) {}
     }
 
     private String appToast(String path) {
@@ -876,59 +1298,64 @@ public final class HttpShellService {
         }
     }
 
-    /** /app/ask?q=问题&options=选项A|选项B|选项C ：弹窗问用户，阻塞等回答（最多 3 个选项，120 秒超时） */
+    /** /app/ask?q=问题&options=选项A|选项B|选项C ：弹窗 + 通知栏双通道问用户，阻塞等回答（最多 3 个选项，120 秒超时） */
     private String appAsk(String path) {
         String q = getParam(queryOf(path), "q", "");
         String optRaw = getParam(queryOf(path), "options", "");
         if (q.isEmpty()) return "NO_QUESTION";
-        if (askBusy) return "[BUSY] 已有一个提问在等用户回答";
-        final MainActivity act = MainActivity.current;
-        if (act == null) {
-            return "[APP_BACKGROUND] App 不在前台，弹不出提问 —— 可先 /app/notify 提醒用户打开 DSHA";
-        }
         String[] parts = optRaw.isEmpty() ? new String[] { "好" } : optRaw.split("\\|");
         final String[] opts = parts.length <= 3 ? parts : new String[] { parts[0], parts[1], parts[2] };
-        askBusy = true;
+        // 检查与置位必须原子（见 askBusy 声明处）。CAS 成功之后立刻进 try，
+        // 保证任何返回路径都会在 finally 里放开它。
+        if (!askBusy.compareAndSet(false, true)) {
+            return "[BUSY] 已有一个提问在等用户回答";
+        }
         try {
             final CountDownLatch latch = new CountDownLatch(1);
-            askLatch = latch;
+            final long myEpoch = askEpoch.incrementAndGet();
             askAnswer = "";
-            act.runOnUiThread(() -> {
-                try {
-                    androidx.appcompat.app.AlertDialog.Builder b =
-                            new androidx.appcompat.app.AlertDialog.Builder(act)
-                                    .setTitle("助手提问").setMessage(q);
-                    b.setPositiveButton(opts[0], (d, w) -> {
-                        askAnswer = opts[0];
-                        latch.countDown();
-                    });
-                    if (opts.length > 1) {
-                        b.setNegativeButton(opts[1], (d, w) -> {
-                            askAnswer = opts[1];
-                            latch.countDown();
-                        });
+            askResolved.set(false);
+            pendingAskLatch = latch;
+
+            // 1. 发送高优先级常驻通知（带选项快捷操作按钮，前台、后台与锁屏均可一键回答）
+            showAskNotification(q, opts, myEpoch);
+
+            // 2. 若前台 Activity 活跃，同时展示弹窗
+            final MainActivity act = MainActivity.current;
+            if (act != null) {
+                act.runOnUiThread(() -> {
+                    try {
+                        if (act.isFinishing() || act.isDestroyed()) return;
+                        androidx.appcompat.app.AlertDialog.Builder b =
+                                new androidx.appcompat.app.AlertDialog.Builder(act)
+                                        .setTitle("💬 助手提问").setMessage(q);
+                        b.setPositiveButton(opts[0], (d, w) -> resolveAsk(opts[0], myEpoch));
+                        if (opts.length > 1) {
+                            b.setNegativeButton(opts[1], (d, w) -> resolveAsk(opts[1], myEpoch));
+                        }
+                        if (opts.length > 2) {
+                            b.setNeutralButton(opts[2], (d, w) -> resolveAsk(opts[2], myEpoch));
+                        }
+                        b.setCancelable(false);
+                        pendingAskDialog = b.show();
+                    } catch (Throwable e) {
+                        android.util.Log.w("DSHA", "提问弹窗弹出失败，仍可从通知回答：" + e);
                     }
-                    if (opts.length > 2) {
-                        b.setNeutralButton(opts[2], (d, w) -> {
-                            askAnswer = opts[2];
-                            latch.countDown();
-                        });
-                    }
-                    b.setOnCancelListener(d -> latch.countDown());
-                    b.setOnDismissListener(d -> latch.countDown());
-                    b.show();
-                } catch (Throwable e) {
-                    latch.countDown();
-                }
-            });
-            boolean answered = latch.await(120, TimeUnit.SECONDS);
-            if (!answered) return "[TIMEOUT] 用户 120 秒内没有回答";
-            return askAnswer.isEmpty() ? "[DISMISSED] 用户关掉了提问框" : askAnswer;
-        } catch (InterruptedException e) {
-            return "[INTERRUPTED]";
+                });
+            }
+
+            try {
+                boolean answered = latch.await(120, TimeUnit.SECONDS);
+                if (!answered) return "[TIMEOUT] 用户 120 秒内没有回答";
+                return askAnswer.isEmpty() ? "[DISMISSED] 用户关掉了提问框" : askAnswer;
+            } catch (InterruptedException e) {
+                return "[INTERRUPTED]";
+            }
         } finally {
-            askBusy = false;
-            askLatch = null;
+            pendingAskLatch = null;
+            dismissAskDialog();
+            cancelAskNotification();
+            askBusy.set(false);
         }
     }
 
@@ -963,24 +1390,12 @@ public final class HttpShellService {
 
 /** 从（仅含 query 的）查询串提取参数。调用方务必先截取 '?' 之后的内容。 */
     private static String getParam(String q, String key, String def) {
-        try {
-            int i = q.indexOf(key + "=");
-            if (i < 0) return def;
-            String v = q.substring(i + key.length() + 1);
-            int amp = v.indexOf('&');
-            if (amp >= 0) v = v.substring(0, amp);
-            int frag = v.indexOf('#');
-            if (frag >= 0) v = v.substring(0, frag);
-            return URLDecoder.decode(v, "UTF-8");
-        } catch (Exception e) {
-            return def;
-        }
+        return Query.param(q, key, def);
     }
 
     // 便捷包装：路径中取 query 部分
     private static String queryOf(String path) {
-        int i = path.indexOf('?');
-        return i >= 0 ? path.substring(i + 1) : "";
+        return Query.of(path);
     }
 
     private boolean confirmEnabled() {
@@ -1005,10 +1420,17 @@ public final class HttpShellService {
             // epoch 先递增：上一轮残留的弹窗/通知按钮带的是旧 epoch，会被丢弃
             final long myEpoch = confirmEpoch.incrementAndGet();
             pendingAllow = false;   // 先写标志，再发布 latch
+            confirmResolved.set(false);  // 必须早于发布 latch：latch 一露面就可能有点击进来
             pendingLatch = latch;
 
             // 通知是权威渠道（前后台都在），前台再叠一个弹窗当快捷方式
             showConfirmNotification(cmd, myEpoch);
+            // 第三条渠道：悬浮条上就地批准。agent 干活时用户往往并不在 App 里 ——
+            // 拉下通知栏找那条通知、或者切回 App，都比点一下已经浮在最上层的按钮慢。
+            // 三条渠道共用同一个 epoch + latch，谁先点谁生效。
+            OverlayController.askConfirm(ctx, cmd,
+                    () -> resolveConfirm(true, myEpoch),
+                    () -> resolveConfirm(false, myEpoch));
             final MainActivity act = MainActivity.current;
             if (act != null) {
                 final String prompt = "模型试图在设备上执行：\n" + cmd + "\n\n是否允许？";
@@ -1050,6 +1472,7 @@ public final class HttpShellService {
             pendingLatch = null;
             dismissConfirmDialog();
             cancelConfirmNotification();
+            OverlayController.dismissConfirm(ctx);
             confirmBusy.set(false);
         }
     }
@@ -1064,15 +1487,17 @@ public final class HttpShellService {
         }
     }
 
-    /** 通知按钮（ConfirmReceiver）与前台弹窗按钮共用的回调。
-     *  epoch 校验 + latch 认领：丢弃迟到的、属于上一个请求的点击。 */
+    /** 通知按钮（ConfirmReceiver）、前台弹窗按钮与悬浮条按钮共用的回调。
+     *  epoch 校验 + 原子认领：丢弃迟到的（属于上一个请求的）点击，以及同一轮里后到的那次。 */
     public void resolveConfirm(boolean allow, long epoch) {
         if (epoch != confirmEpoch.get()) {
             android.util.Log.i("DSHA", "忽略过期的确认点击（epoch " + epoch + "）");
             return;
         }
         CountDownLatch l = pendingLatch;
-        if (l == null || l.getCount() == 0) return; // 已决或无挂起
+        if (l == null || l.getCount() == 0) return; // 已决或无挂起（快速路径）
+        // 真正的认领在这里，且必须原子 —— 上面那个 getCount 检查挡不住两条渠道同时点。
+        if (!confirmResolved.compareAndSet(false, true)) return;
         pendingAllow = allow;
         l.countDown();
         dismissConfirmDialog();
@@ -1100,6 +1525,12 @@ public final class HttpShellService {
     private void showConfirmNotification(String cmd, long epoch) {
         createConfirmChannel();
         String shortCmd = cmd.length() > 100 ? cmd.substring(0, 100) + "…" : cmd;
+        Intent openAppIntent = new Intent(ctx, MainActivity.class)
+                .putExtra("open_web", true)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent contentPi = PendingIntent.getActivity(ctx, 30, openAppIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
         // epoch 随 Intent 带回：残留通知上的旧按钮会因 epoch 过期被丢弃
         Intent allowI = new Intent(ctx, ConfirmReceiver.class).setAction(ConfirmReceiver.ACTION_ALLOW)
                 .putExtra(ConfirmReceiver.EXTRA_EPOCH, epoch);
@@ -1115,6 +1546,8 @@ public final class HttpShellService {
                 .setContentText("模型试图执行：" + shortCmd)
                 .setStyle(new NotificationCompat.BigTextStyle()
                         .bigText("模型试图在设备上执行：\n" + cmd + "\n\n是否允许？"))
+                .setContentIntent(contentPi)
+                .setAutoCancel(true)
                 .addAction(0, "允许", allowPi)
                 .addAction(0, "拒绝", denyPi)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -1127,6 +1560,89 @@ public final class HttpShellService {
     private void cancelConfirmNotification() {
         NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(CONFIRM_NOTIF_ID);
+    }
+
+    private void showAskNotification(String q, String[] opts, long epoch) {
+        createConfirmChannel();
+        String shortQ = q.length() > 100 ? q.substring(0, 100) + "…" : q;
+        Intent openAppIntent = new Intent(ctx, MainActivity.class)
+                .putExtra("open_web", true)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent contentPi = PendingIntent.getActivity(ctx, 39, openAppIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        NotificationCompat.Builder nb = new NotificationCompat.Builder(ctx, CONFIRM_CHANNEL)
+                .setSmallIcon(R.drawable.ic_launch)
+                .setContentTitle("💬 助手提问")
+                .setContentText(shortQ)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(q))
+                .setContentIntent(contentPi)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setOngoing(true);
+
+        for (int i = 0; i < opts.length; i++) {
+            String opt = opts[i];
+            Intent intent = new Intent(ctx, ConfirmReceiver.class)
+                    .setAction(ConfirmReceiver.ACTION_ASK_ANSWER)
+                    .putExtra(ConfirmReceiver.EXTRA_EPOCH, epoch)
+                    .putExtra(ConfirmReceiver.EXTRA_ANSWER, opt);
+            PendingIntent pi = PendingIntent.getBroadcast(ctx, 40 + i, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            nb.addAction(0, opt, pi);
+        }
+
+        // 挂载 RemoteInput 直接就地文本输入快捷回复
+        androidx.core.app.RemoteInput remoteInput = new androidx.core.app.RemoteInput.Builder(ConfirmReceiver.EXTRA_REPLY_TEXT)
+                .setLabel("输入回复内容...")
+                .build();
+        Intent replyIntent = new Intent(ctx, ConfirmReceiver.class)
+                .setAction(ConfirmReceiver.ACTION_ASK_REPLY)
+                .putExtra(ConfirmReceiver.EXTRA_EPOCH, epoch);
+        PendingIntent replyPi = PendingIntent.getBroadcast(ctx, 49, replyIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : 0));
+        NotificationCompat.Action replyAction = new NotificationCompat.Action.Builder(
+                R.drawable.ic_launch, "💬 快捷输入", replyPi)
+                .addRemoteInput(remoteInput)
+                .build();
+        nb.addAction(replyAction);
+
+        NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) nm.notify(Constants.NOTIF_ASK_QUESTION, nb.build());
+    }
+
+    private void cancelAskNotification() {
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(Constants.NOTIF_ASK_QUESTION);
+        } catch (Throwable ignored) {}
+    }
+
+    private void dismissAskDialog() {
+        final androidx.appcompat.app.AlertDialog d = pendingAskDialog;
+        if (d == null) return;
+        pendingAskDialog = null;
+        try {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                try {
+                    if (d.isShowing()) d.dismiss();
+                } catch (Throwable ignored) {}
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    public void resolveAsk(String answer, long epoch) {
+        if (epoch != askEpoch.get()) {
+            android.util.Log.i("DSHA", "忽略过期的提问点击（epoch " + epoch + "）");
+            return;
+        }
+        CountDownLatch l = pendingAskLatch;
+        if (l == null || l.getCount() == 0) return;
+        if (!askResolved.compareAndSet(false, true)) return;
+        askAnswer = answer;
+        l.countDown();
+        dismissAskDialog();
+        cancelAskNotification();
     }
 
     private void createConfirmChannel() {

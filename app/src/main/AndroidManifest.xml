@@ -13,7 +13,30 @@
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- WifiLock 用：熄屏后 WiFi 会进省电模式，3081 局域网桥与联网安装都会断 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 流式悬浮条（把 agent 正在生成的内容显示在屏幕顶部）。
+         默认关闭、需要用户在系统设置里单独授予；不给也只是这一个功能不可用。
+         真正的「状态栏歌词」没有公开接口（只有 Flyme/exTHmUI 认 ticker flag，
+         其余机型要 Xposed），所以走自绘悬浮窗这条免 ROOT 的路。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- 位置：让 agent 能回答「我在哪」「附近有什么」这类问题。
+         运行时权限，且 DSHA 侧还有一道开关（cap_location，**默认关**）——
+         位置是能定位到人的信息，不该因为装了 App 就默认开着。
+         标 required=false：没有 GPS 的设备（部分平板）照样能装。 -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature
+        android:name="android.hardware.location"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.sensor.light"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.flash"
+        android:required="false" />
     <!-- ADB 保活：系统休眠会冻结后台网络，加入电池优化白名单后连接才能长期在线。
          一次性弹窗申请（本 App 不上架 Play，不受该权限的商店政策限制）。 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -63,6 +86,16 @@
             android:excludeFromRecents="true"
             android:label="ADB 无线配对"
             android:theme="@style/Theme.AppCompat.Dialog" />
+
+        <!-- 快捷对话底部抽屉弹层（点击常驻通知或任务完成通知直达，独立任务栈物理隔离） -->
+        <activity
+            android:name=".QuickChatSheetActivity"
+            android:exported="false"
+            android:taskAffinity="com.dsh.client.quick_sheet"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.DeepseekHarness.SheetTransparent" />
 
         <service
             android:name=".HarnessService"

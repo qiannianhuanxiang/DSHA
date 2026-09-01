@@ -84,6 +84,14 @@ public class HarnessService extends Service {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             c.stopWeb();
             stopKeepAlive();
+            // 设备桥（127.0.0.1:3090）也一起停 —— 它是独立的后台服务，不跟着前台服务走。
+            // 「停止」在用户眼里就是全停：留个监听端口在那儿既费电，也会让覆盖安装时系统
+            // 多一个要终止的目标（装 391MB 包时那正是 Session destroyed 的诱因之一，
+            // 所以装新包前点一下通知栏这个「停止」就够，不必再去设置页找入口）。
+            try {
+                stopService(new Intent(this, DeviceBridgeService.class));
+            } catch (Throwable ignored) {
+            }
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
@@ -92,6 +100,12 @@ public class HarnessService extends Service {
             // 软重启：深停 → 等端口关透 → 重新拉起（不再杀 App 进程「闪退」重启）
             c.restartWeb();
             startKeepAlive();
+            return START_STICKY;
+        }
+        // intent 为 null = 系统因 START_STICKY 把服务重建了。这时若用户此前明确停过，
+        // 就不该再拉起 Web —— 否则他永远停不掉，只剩「强制停止」这一条路。
+        // 前台服务壳留着（保持通知与后续可点启动），但不碰 Web 与保活。
+        if (intent == null && !c.shouldAutoStartWeb("服务被系统重建")) {
             return START_STICKY;
         }
         startWeb();
@@ -104,8 +118,83 @@ public class HarnessService extends Service {
     }
 
     /** 启动保活监听：TCP 探测 WebUI 端口，连续失联自动重启（带冷却防风暴） */
+    /** 息屏保活用的两把锁。 */
+    private android.os.PowerManager.WakeLock wakeLock;
+    private android.net.wifi.WifiManager.WifiLock wifiLock;
+
+    /** ADB 后台加固每个进程只做一次（命令幂等，但起 python + adb 有几秒开销）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean hardenedOnce =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 息屏保活：拿 {@code PARTIAL_WAKE_LOCK} 让 CPU 不随熄屏休眠。
+     *
+     * <p><b>WAKE_LOCK 权限在清单里声明了很久，但全树一直没有任何地方真正获取过 WakeLock。</b>
+     * 后果是熄屏之后 CPU 进休眠，容器里的 node 被冻结，WebUI 自然失联；更糟的是保活线程
+     * 自己也睡在 {@code Thread.sleep} 上、同样被冻住，连「发现失联再拉起」都做不到 ——
+     * 于是熄屏一会儿回来，什么都停了。这是「息屏跑不住」最直接的一环。
+     *
+     * <p>顺带拿 WifiLock：熄屏后 WiFi 会进省电模式，3081 局域网桥与联网安装都会断。
+     * {@code WIFI_MODE_FULL_HIGH_PERF} 在 Android 12+ 标了弃用但仍然生效，
+     * 没有等价替代，所以照用。
+     *
+     * <p>代价是耗电，做成可关（{@code keepalive_wakelock}，默认开 —— 装 DSHA 本来就是
+     * 要它在后台跑）。释放跟着 {@link #stopKeepAlive()} 走，与前台服务同生命周期。
+     */
+    private void acquireLocks() {
+        try {
+            if (!getSharedPreferences("deepseekharness", MODE_PRIVATE)
+                    .getBoolean("keepalive_wakelock", true)) {
+                return;
+            }
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null && (wakeLock == null || !wakeLock.isHeld())) {
+                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "DSHA:web");
+                wakeLock.setReferenceCounted(false);
+                wakeLock.acquire();
+                android.util.Log.i("DSHA", "[保活] 已持有 PARTIAL_WAKE_LOCK");
+            }
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                    getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wm != null && (wifiLock == null || !wifiLock.isHeld())) {
+                wifiLock = wm.createWifiLock(
+                        android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DSHA:wifi");
+                wifiLock.setReferenceCounted(false);
+                wifiLock.acquire();
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("DSHA", "[保活] 取锁失败（不致命，继续跑）: " + t);
+        }
+    }
+
+    private void releaseLocks() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Throwable ignored) {
+        }
+        wakeLock = null;
+        wifiLock = null;
+    }
+
     private void startKeepAlive() {
         stopKeepAlive();
+        acquireLocks();
+        // 顺手用 ADB 通道开一次后台白名单（Doze + appops）。幂等，所以每个进程只跑一次；
+        // 异步跑是因为它要在容器里起 python + adb，几秒级，不能拖住前台服务的启动路径。
+        // ADB 没接上时 hardenBackground 自己会跳过。
+        if (hardenedOnce.compareAndSet(false, true)) {
+            new Thread(() -> {
+                try {
+                    c.hardenBackground();
+                } catch (Throwable ignored) {
+                }
+            }, "dsha-harden").start();
+        }
         keepAliveRunning = true;
         keepAliveThread = new Thread(() -> {
             int fail = 0;
@@ -134,10 +223,8 @@ public class HarnessService extends Service {
                 if (fail < KEEPALIVE_MAX_FAIL) continue;
                 fail = 0;
                 long now = System.currentTimeMillis();
-                if (c.isKeepAlivePaused() || HarnessController.isHealingSession()) {
-                    // 用户手动停止过、或会话自愈进行中：不自动拉起（防止边修边写）
-                    continue;
-                }
+                // 手动停止 / 会话自愈 / 刚停过的冷却期，统一判据在 shouldAutoStartWeb
+                if (!c.shouldAutoStartWeb("保活")) continue;
                 if (now - lastRestartAt.get() < RESTART_COOLDOWN_MS) continue; // 冷却期，等它自己缓过来
                 lastRestartAt.set(now);
                 if (restarting.compareAndSet(false, true)) {
@@ -156,6 +243,7 @@ public class HarnessService extends Service {
     }
 
     private void stopKeepAlive() {
+        releaseLocks();
         keepAliveRunning = false;
         if (keepAliveThread != null) {
             keepAliveThread.interrupt();
@@ -214,7 +302,9 @@ public class HarnessService extends Service {
     }
 
     private Notification buildNotification(String title, String text) {
-        Intent intent = new Intent(this, MainActivity.class);
+        // 点击常驻通知直接从屏幕底部弹出快捷对话抽屉（REORDER_TO_FRONT 唤醒常驻单例，避免销毁）
+        Intent intent = new Intent(this, QuickChatSheetActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Intent stop = new Intent(this, HarnessService.class).setAction(ACTION_STOP);

@@ -29,5 +29,24 @@
 
         <item name="alertDialogTheme">@style/Dialog.DSHA.Alert</item>
         <item name="materialAlertDialogTheme">@style/Dialog.DSHA.Material</item>
+
+        <!-- 必须和 values/themes.xml 保持一致：Material3 会把 <Button> 膨胀成
+             MaterialButton 并用 backgroundTint=colorPrimary 填充，忽略
+             android:background。深色模式下 primary 是浅蓝 #7DA7F4，
+             配 text_secondary #A6B0C3 对比度只有约 1.3:1 —— 就是用户看到的
+             「浅蓝底白字看不清」。上一版只改了 day 那份，深色模式毫无变化。 -->
+        <item name="materialButtonStyle">@style/Widget.DSHA.Button</item>
+    </style>
+
+    <!-- 快捷抽屉弹层专用全屏透明主题（深色模式） -->
+    <style name="Theme.DeepseekHarness.SheetTransparent" parent="Theme.DeepseekHarness">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackground">@android:color/transparent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
     </style>
 </resources>

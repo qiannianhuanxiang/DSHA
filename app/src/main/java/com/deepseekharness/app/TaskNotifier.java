@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class TaskNotifier {
 
-    public static final String CHANNEL_ID = "dsh_task_channel";
+    public static final String CHANNEL_ID = Constants.CHANNEL_TASK_RESULT;
     private static final int NOTIF_ID = 2002;
     private static final long POLL_MS = 4000;
     private static final long IDLE_MS = 90000;      // 静默 90 秒判定完成（容忍 agent 长思考）
@@ -88,28 +88,43 @@ public class TaskNotifier {
     }
 
     private void notifyDone() {
-        Intent intent = new Intent(ctx, MainActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) {
+            nm.cancel(Constants.NOTIF_TASK_RUNNING);
+        }
+
+        Intent intent = new Intent(ctx, QuickChatSheetActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent pi = PendingIntent.getActivity(ctx, 0, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        // 点击「💬 继续对话」直接从屏幕底部唤起抽屉弹层
+        Intent actionIntent = new Intent(ctx, QuickChatSheetActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent actionPi = PendingIntent.getActivity(ctx, 26, actionIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        NotificationCompat.Action replyAction = new NotificationCompat.Action.Builder(
+                R.drawable.ic_launch, "💬 继续对话", actionPi)
+                .build();
+
         Notification n = new NotificationCompat.Builder(ctx, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launch)
                 .setContentTitle("DSHA · 任务完成")
                 .setContentText("智能体已结束任务，点击查看结果")
                 .setContentIntent(pi)
+                .addAction(replyAction)
                 .setAutoCancel(true)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .build();
-        NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm != null) nm.notify(NOTIF_ID, n);
     }
 
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "任务完成提醒",
+                    CHANNEL_ID, "任务结果与交互",
                     NotificationManager.IMPORTANCE_HIGH);
-            ch.setDescription("智能体任务完成时通知");
+            ch.setDescription("智能体任务完成、异常结束或终止时的结果通知");
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm != null) nm.createNotificationChannel(ch);
         }

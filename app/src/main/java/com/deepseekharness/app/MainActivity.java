@@ -28,12 +28,39 @@ public class MainActivity extends AppCompatActivity {
     /** 当前前台 Activity（HttpShellService 用它弹确认框）；null = 不在前台 */
     public static volatile MainActivity current = null;
 
+    /** 自动恢复弹窗的「手动选择」出口。分区存储下 SAF 是读取「别的安装写进
+     *  Download/DSHA 的备份」唯一不需要权限、也一定能成的办法（issue #22）。
+     *  注册必须发生在 Activity 进入 STARTED 之前，所以放在字段初始化里。 */
+    private final androidx.activity.result.ActivityResultLauncher<String[]> backupPicker =
+            registerForActivityResult(
+                    new androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+                    uri -> {
+                        if (uri != null) {
+                            HarnessController.get(this).restorePickedUri(this, uri);
+                        }
+                    });
+
+    /** 供 HarnessController 的恢复弹窗调用：打开系统文件选择器挑备份包。 */
+    public void pickBackupForRestore() {
+        try {
+            // MediaStore 给 tar.gz 记的 MIME 各家 ROM 不一，多给几个并兜 */*，
+            // 否则用户会看到「没有可选文件」。
+            backupPicker.launch(new String[]{"application/gzip", "application/x-gzip",
+                    "application/x-tar", "application/octet-stream", "*/*"});
+        } catch (Throwable e) {
+            Toast.makeText(this, "无法打开文件选择器：" + e, Toast.LENGTH_LONG).show();
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         // 崩溃捕获已统一在 DshaApp 安装一次（防止 Activity 重建导致重复/覆盖 handler）
 
         // 首次启动进入引导页
+        // 静态标志跨 Activity 存活：若上个 Activity 在恢复弹窗显示期间被销毁，
+        // dismiss 回调不会触发，标志会永久卡在 true，权限弹窗从此再也不弹。
+        HarnessController.restoreFlowActive = false;
         SharedPreferences prefs = getSharedPreferences("deepseekharness", MODE_PRIVATE);
         if (!prefs.getBoolean("welcomed", false)) {
             startActivity(new Intent(this, WelcomeActivity.class));
@@ -75,11 +102,14 @@ public class MainActivity extends AppCompatActivity {
         HarnessController.get(this).ensureBuiltinPluginsReady();
         // 崩溃自愈提示：上次异常退出时读 crash.log 告知原因（不阻塞使用）
         showCrashRecoveryNotice();
-        // 解压完成后进入主界面（skip_extract=true）才检测"全新环境可恢复"，
-        // 避免首启解压前 rootfs 未就绪误弹恢复框（恢复内容会被解压流程覆盖）
-        if (getIntent().getBooleanExtra("skip_extract", false)) {
-            HarnessController.get(this).maybePromptRestore(this);
-        }
+        // 全新环境可恢复检测。走到这里 rootfs 一定已解压（skip_extract=true 来自
+        // ExtractActivity，否则上面 isOfflineExtracted() 不通过就已跳走），所以不再限定
+        // skip_extract —— 首启那次弹窗被用户划掉/进程被杀后，下次开 App 还有机会补上
+        // （issue #22）。方法内部只在 .dsh 尚无用户数据时才弹，不会覆盖已有数据。
+        HarnessController.get(this).maybePromptRestore(this);
+        // 上次重解压没走完 → 数据保护目录还在，问用户要不要把数据恢复回来。
+        // **必须排在升级提示之前**：数据没归位就再提示重解压，只会把同一个失败重复一遍。
+        HarnessController.get(this).maybeOfferPreservedDataRecovery(this);
         // 离线包升级感知：APK 内置新离线包 → 提示重解压（数据自动保留）。
         // 放外面：正常启动（rootfs 已解压）也要检测，方法内部自带
         // isOfflineExtracted() 保护（首启未解压时静默）。
@@ -100,6 +130,16 @@ public class MainActivity extends AppCompatActivity {
 
         nav.setOnItemSelectedListener(item -> {
             int id = item.getItemId();
+            // GitHub 链接输入框只在插件页有意义：切走就藏起来并清空，
+            // 否则它会顶着别的页面的标题栏，还留着上次的内容。
+            android.widget.EditText ghIn = findViewById(R.id.appbar_github_input);
+            View spacer = findViewById(R.id.appbar_spacer);
+            if (ghIn != null) {
+                boolean onPlugins = id == R.id.nav_plugins;
+                ghIn.setVisibility(onPlugins ? View.VISIBLE : View.GONE);
+                if (spacer != null) spacer.setVisibility(onPlugins ? View.GONE : View.VISIBLE);
+                if (!onPlugins) ghIn.setText("");
+            }
             getSupportFragmentManager().popBackStack(null,
                     androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE);
             Fragment f;
@@ -107,7 +147,11 @@ public class MainActivity extends AppCompatActivity {
                 f = new LaunchFragment();
                 setAppTitle("启动");
             } else if (id == R.id.nav_terminal) {
-                f = new TerminalFragment();
+                // 两套终端并存：默认 PTY 那套（跑得了 vim / htop / tmux），页内点「简易」
+                // 可以退回旧的 TextView 版本 —— 新终端万一在某些机型上出问题，
+                // 用户不至于连命令行都没了。选择记在 PtyTerminalFragment.KEY_PTY。
+                f = PtyTerminalFragment.preferred(this)
+                        ? new PtyTerminalFragment() : new TerminalFragment();
                 setAppTitle("终端");
             } else if (id == R.id.nav_plugins) {
                 f = new PluginFragment();
@@ -121,6 +165,47 @@ public class MainActivity extends AppCompatActivity {
         });
         if (savedInstanceState == null) {
             nav.setSelectedItemId(R.id.nav_launch);
+        }
+        handleIntentRouting(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntentRouting(intent);
+    }
+
+    private void handleIntentRouting(Intent intent) {
+        if (intent == null) return;
+
+        // 1. 固定重置回到容器后台主页（关闭全屏网页并切到启动页）
+        if (intent.getBooleanExtra("go_home", false)) {
+            BottomNavigationView nav = findViewById(R.id.bottom_nav);
+            if (nav != null && nav.getSelectedItemId() != R.id.nav_launch) {
+                nav.setSelectedItemId(R.id.nav_launch);
+            }
+            Fragment f = getSupportFragmentManager().findFragmentById(R.id.fragment_container);
+            if (f instanceof LaunchFragment) {
+                ((LaunchFragment) f).closeWeb();
+            }
+            return;
+        }
+
+        // 2. 直达全屏网页对话
+        handleNotificationEnterWeb(intent);
+    }
+
+    private void handleNotificationEnterWeb(Intent intent) {
+        if (intent != null && (intent.getBooleanExtra("open_web", false) || intent.getBooleanExtra("auto_enter_web", false))) {
+            BottomNavigationView nav = findViewById(R.id.bottom_nav);
+            if (nav != null && nav.getSelectedItemId() != R.id.nav_launch) {
+                nav.setSelectedItemId(R.id.nav_launch);
+            }
+            Fragment f = getSupportFragmentManager().findFragmentById(R.id.fragment_container);
+            if (f instanceof LaunchFragment) {
+                ((LaunchFragment) f).enterWebDirectly();
+            }
         }
     }
 
@@ -229,6 +314,88 @@ public class MainActivity extends AppCompatActivity {
         }
         current = this;
         TaskNotifier.appInForeground = true;
+        // 从「所有文件访问」设置页返回时能立刻发现已授予 → 补跑一次数据迁移
+        maybeRequestAllFilesAccess();
+    }
+
+    /** 申请「所有文件访问」（All Files Access）。
+     *
+     *  为什么需要：会话/设置/附件要迁到 /sdcard/Documents/dshdata 才能做到
+     *  **卸载重装不丢**。而 Android 11+ 下没有这个权限就写不进公开目录，
+     *  迁移脚本只会静默跳过 —— 用户以为数据安全了，其实还在私有目录里，
+     *  一卸载全没。
+     *
+     *  这是特殊权限，不能用运行时弹窗授予，必须跳系统设置页由用户手动开。
+     *  所以：说清理由 → 跳设置页 → 回来后自动补跑迁移。
+     *  用户拒绝也不纠缠（只问一次），但自检里会持续提示风险。 */
+    /** 供恢复流程结束后调用：那时才轮到我们问权限。 */
+    void recheckAllFilesAccess() {
+        maybeRequestAllFilesAccess();
+    }
+
+    private void maybeRequestAllFilesAccess() {
+        try {
+            if (Build.VERSION.SDK_INT < 30) return;      // 老系统本来就能直写公共目录
+            // 恢复弹窗优先：它和我们要的是同一个权限，用户刚重装时恢复数据更紧急。
+            // 直接 return 而不标记 asked_all_files —— 否则「只问一次」的额度
+            // 会被这次让路白白用掉，等恢复流程结束就再也不问了。
+            if (HarnessController.restoreFlowActive) return;
+            SharedPreferences prefs = getSharedPreferences("deepseekharness", MODE_PRIVATE);
+            if (android.os.Environment.isExternalStorageManager()) {
+                // 已授予：如果之前因为没权限跳过过迁移，这里补跑一次（幂等、失败无感）
+                if (!prefs.getBoolean("public_data_migrated", false)) {
+                    prefs.edit().putBoolean("public_data_migrated", true).apply();
+                    final HarnessController hc = HarnessController.get(this);
+                    new Thread(() -> {
+                        try {
+                            hc.migratePublicDataNow();
+                        } catch (Throwable ignored) {
+                        }
+                    }, "dsha-migrate-after-grant").start();
+                    // 授权后备份就能被枚举到了（#32 实测：授权前 0 个、授权后 14 个全可读）。
+                    // 之前因为看不见而给出的「手动选择」提示，现在可以换成真正的恢复建议。
+                    try {
+                        prefs.edit().remove("restore_prompt_declined").apply();
+                        hc.maybePromptRestore(this);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                return;
+            }
+            // 未授予且已经问过 → 不再打扰（自检里仍会报「卸载会丢数据」）
+            if (prefs.getBoolean("asked_all_files", false)) return;
+            // 正在结束的 Activity 上 show() 会抛 BadTokenException（本项目踩过一次）
+            if (isFinishing() || isDestroyed()) return;
+            prefs.edit().putBoolean("asked_all_files", true).apply();
+            new androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("让对话数据卸载重装不丢")
+                    .setMessage("需要「所有文件访问」权限，把会话、设置、附件存到\n"
+                            + "内部存储/Documents/dshdata\n\n"
+                            + "· 卸载 App 或换机重装后数据仍在\n"
+                            + "· 文件管理器里可以直接看到和备份\n"
+                            + "· API Key 不会存进去（仍留在 App 私有区并加密）\n\n"
+                            + "不开也能正常使用，但数据只存在 App 私有目录里，卸载即丢失。")
+                    .setPositiveButton("去开启", (d, w) -> {
+                        try {
+                            Intent i = new Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                            i.setData(Uri.parse("package:" + getPackageName()));
+                            startActivity(i);
+                        } catch (Throwable e) {
+                            // 个别 ROM 没有这个页面：退到应用详情页，用户仍能找到开关
+                            try {
+                                Intent i2 = new Intent(
+                                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                                i2.setData(Uri.parse("package:" + getPackageName()));
+                                startActivity(i2);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    })
+                    .setNegativeButton("以后再说", null)
+                    .show();
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
@@ -245,6 +412,7 @@ public class MainActivity extends AppCompatActivity {
         // 旋转屏幕/配置变化触发 onDestroy 时 isFinishing()=false，保留会话（否则转屏即丢终端）
         if (isFinishing()) {
             TerminalFragment.shutdownShell();
+            PtyTerminalFragment.shutdown();
         }
     }
 
